@@ -1,0 +1,191 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>采购单对账台</title>
+<style>
+  :root{color-scheme:light dark;font-family:system-ui,-apple-system,"Noto Sans CJK SC",sans-serif}
+  body{margin:0;padding:1.5rem;max-width:80rem}
+  h1{font-size:1.25rem}
+  table{border-collapse:collapse;width:100%;margin:.75rem 0 1.5rem;font-size:.85rem}
+  th,td{border:1px solid color-mix(in srgb,currentColor 25%,transparent);padding:.35rem .5rem;text-align:left;vertical-align:top}
+  th{background:color-mix(in srgb,currentColor 8%,transparent)}
+  code{font-family:ui-monospace,monospace;font-size:.8rem}
+  .muted{opacity:.65}
+  .num{text-align:right;font-variant-numeric:tabular-nums}
+  button{font:inherit;padding:.25rem .6rem;cursor:pointer}
+  form{display:flex;flex-wrap:wrap;gap:.5rem;align-items:end;margin:.5rem 0 1rem}
+  label{display:flex;flex-direction:column;font-size:.8rem;gap:.15rem}
+  input{font:inherit;padding:.2rem .35rem;width:9rem}
+  pre{white-space:pre-wrap;word-break:break-all;font-size:.75rem;max-height:24rem;overflow:auto;border:1px solid color-mix(in srgb,currentColor 20%,transparent);padding:.5rem}
+</style>
+</head>
+<body>
+<h1>采购单对账台 <span class="muted">（仅本地合成供应商）</span></h1>
+<p class="muted">预占 = 已占额度；实际扣费 = 来源确认的披露费用；释放 = 未发送或未受理而归还的额度；未知费用 = 已发出但尚未确认的预占。所有金额为整数最小货币单位。</p>
+
+<form id="order-form">
+  <label>采购单号<input name="id" required placeholder="PO-001"></label>
+  <label>授权用途<input name="purpose" required placeholder="授信评估"></label>
+  <label>资料版本<input name="version" type="number" min="1" value="1" required></label>
+  <label>预算<input name="budget" type="number" min="0" value="30" required></label>
+  <label>截止时间<input name="deadline" type="datetime-local" required></label>
+  <button type="submit">新建采购单</button>
+</form>
+
+<h2>采购单</h2>
+<table id="orders"><thead><tr>
+  <th>采购单</th><th>用途</th><th>版本</th><th>状态</th><th class="num">预算</th><th class="num">预占</th><th class="num">实际</th><th class="num">释放</th><th class="num">未知</th><th class="num">可用</th><th>截止</th><th></th>
+</tr></thead><tbody></tbody></table>
+
+<h2>未知费用（需人工处理）</h2>
+<table id="unknown"><thead><tr>
+  <th>采购单</th><th>领取</th><th>请求号</th><th class="num">预占金额</th><th>最后错误</th><th>处理</th>
+</tr></thead><tbody></tbody></table>
+
+<h2>领取明细</h2>
+<table id="lines"><thead><tr>
+  <th>采购单</th><th>资料</th><th>阶段</th><th class="num">预占</th><th class="num">实际</th><th class="num">释放</th><th>请求号</th><th>结果摘要</th>
+</tr></thead><tbody></tbody></table>
+
+<h2>披露记录</h2>
+<table id="disclosures"><thead><tr>
+  <th>披露</th><th>采购单</th><th>用途</th><th>版本</th><th class="num">扣费</th><th>状态</th><th>取得时间</th><th>复用截止</th><th>原文 SHA-256</th>
+</tr></thead><tbody></tbody></table>
+
+<h2>原始资料</h2>
+<div id="raw" class="muted">选择领取明细中的“查看原文”。</div>
+<pre id="raw-body" hidden></pre>
+
+<script>
+const money = value => Number(value ?? 0).toLocaleString('zh-CN');
+const cell = text => { const td = document.createElement('td'); td.textContent = text ?? ''; return td; };
+const numCell = value => { const td = cell(money(value)); td.className = 'num'; return td; };
+
+async function api(path, options = {}) {
+  const response = await fetch(path, {
+    ...options,
+    headers: {'content-type': 'application/json'},
+    body: options.body ? JSON.stringify(options.body) : undefined
+  });
+  const value = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(value.error || response.status);
+  return value;
+}
+
+function render(report) {
+  const orders = document.querySelector('#orders tbody');
+  orders.replaceChildren(...report.orders.map(order => {
+    const tr = document.createElement('tr');
+    tr.append(cell(order.id), cell(order.purpose), cell(order.version), cell(order.status),
+      numCell(order.budget), numCell(order.reserved), numCell(order.actual), numCell(order.released),
+      numCell(order.unknownAmount), numCell(order.available), cell(order.deadline));
+    const actions = document.createElement('td');
+    if (order.status === 'active') {
+      for (const [label, path, body] of [
+        ['领取', `/orders/${encodeURIComponent(order.id)}/lines`, {entityKey: `enterprise-${Date.now()}`}],
+        ['处理', `/orders/${encodeURIComponent(order.id)}/process`, {}],
+        ['取消', `/orders/${encodeURIComponent(order.id)}/cancel`, {reason: '界面取消', actor: 'operator'}]
+      ]) {
+        const button = document.createElement('button');
+        button.textContent = label;
+        button.onclick = async () => { await api(path, {method: 'POST', body}); await refresh(); };
+        actions.append(button, document.createTextNode(' '));
+      }
+    }
+    tr.append(actions);
+    return tr;
+  }));
+
+  const unknown = document.querySelector('#unknown tbody');
+  unknown.replaceChildren(...report.unknown.map(item => {
+    const tr = document.createElement('tr');
+    tr.append(cell(item.orderId), cell(item.lineId), cell(item.requestId), numCell(item.amount), cell(item.lastError?.message));
+    const actions = document.createElement('td');
+    for (const [label, path] of [['重新查单', `/lines/${encodeURIComponent(item.lineId)}/resolve`]]) {
+      const button = document.createElement('button');
+      button.textContent = label;
+      button.onclick = async () => {
+        const evidence = prompt('处理依据（写入审计记录）');
+        if (!evidence) return;
+        await api(path, {method: 'POST', body: {outcome: 'requery', operator: 'operator', evidence}});
+        await refresh();
+      };
+      actions.append(button);
+    }
+    tr.append(actions);
+    return tr;
+  }));
+  if (!report.unknown.length) {
+    const tr = document.createElement('tr');
+    const td = cell('没有未知费用。'); td.colSpan = 6; td.className = 'muted';
+    tr.append(td); unknown.append(tr);
+  }
+
+  const lines = document.querySelector('#lines tbody');
+  lines.replaceChildren(...report.orders.flatMap(order => order.lines.map(line => {
+    const tr = document.createElement('tr');
+    tr.append(cell(order.id), cell(line.entityKey), cell(line.phase), numCell(line.reserved),
+      numCell(line.actual), numCell(line.released), cell(line.requestId));
+    const result = document.createElement('td');
+    if (line.result) {
+      result.append(cell(line.result.sha256.slice(0, 16) + '…'));
+      const button = document.createElement('button');
+      button.textContent = '查看原文';
+      button.onclick = () => showRaw(line);
+      result.append(button);
+    } else {
+      result.textContent = line.reused ? `复用 ${line.reusedFrom}` : '';
+    }
+    tr.append(result);
+    return tr;
+  })));
+
+  const disclosures = document.querySelector('#disclosures tbody');
+  disclosures.replaceChildren(...report.disclosures.map(disclosure => {
+    const tr = document.createElement('tr');
+    tr.append(cell(disclosure.id), cell(disclosure.orderId), cell(disclosure.purpose), cell(disclosure.version),
+      numCell(disclosure.charged), cell(disclosure.status), cell(disclosure.retrievedAt),
+      cell(disclosure.expiresAt), cell(disclosure.resultSha256));
+    return tr;
+  }));
+}
+
+function showRaw(line) {
+  const target = document.querySelector('#raw-body');
+  const bytes = Uint8Array.from(atob(line.result.bytesBase64), character => character.charCodeAt(0));
+  target.textContent = `sha256: ${line.result.sha256}\n` + new TextDecoder().decode(bytes);
+  target.hidden = false;
+}
+
+async function refresh() {
+  try {
+    render(await api('/report'));
+  } catch (error) {
+    console.error(error);
+  }
+}
+
+document.querySelector('#order-form').addEventListener('submit', async event => {
+  event.preventDefault();
+  const data = new FormData(event.target);
+  const deadline = new Date(data.get('deadline')).toISOString();
+  await api('/orders', {
+    method: 'POST',
+    body: {
+      id: data.get('id'),
+      purpose: data.get('purpose'),
+      version: Number(data.get('version')),
+      budget: Number(data.get('budget')),
+      deadline
+    }
+  });
+  await refresh();
+});
+
+refresh();
+setInterval(refresh, 3000);
+</script>
+</body>
+</html>
